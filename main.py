@@ -18,6 +18,7 @@ import httpx
 import psutil
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from starlette.requests import ClientDisconnect
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
@@ -130,13 +131,8 @@ def _record_traffic(uuid_str: str, n: int):
     if len(hourly_traffic) > 24:
         oldest = sorted(hourly_traffic.keys())[0]
         del hourly_traffic[oldest]
-    asyncio.create_task(_add_usage_bg(uuid_str, n))
-
-
-async def _add_usage_bg(uuid_str: str, n: int):
-    async with LINKS_LOCK:
-        if uuid_str in LINKS:
-            LINKS[uuid_str]["used_bytes"] += n
+    if uuid_str in LINKS:
+        LINKS[uuid_str]["used_bytes"] += n
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -213,6 +209,12 @@ async def lifespan(app_instance: FastAPI):
 app = FastAPI(docs_url=None, redoc_url=None, lifespan=lifespan)
 
 
+# ─── Global Exception Handlers ────────────────────────────────────────────────
+@app.exception_handler(ClientDisconnect)
+async def client_disconnect_handler(request: Request, exc: ClientDisconnect):
+    return Response(status_code=499)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Health Check
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -239,7 +241,7 @@ async def ws_proxy(websocket: WebSocket, uuid: str):
         await websocket.close(code=1008, reason="quota exceeded")
         return
 
-    await websocket.accept(subprotocol="binary")
+    await websocket.accept()
 
     try:
         header_data = await asyncio.wait_for(websocket.receive_bytes(), timeout=30.0)
@@ -272,40 +274,50 @@ async def ws_proxy(websocket: WebSocket, uuid: str):
             await writer.drain()
 
         async def ws_to_tcp():
+            nonlocal quota_ok
             try:
                 while True:
                     data = await websocket.receive_bytes()
-                    if not await check_quota(uuid, len(data)):
-                        break
-                    _record_traffic(uuid, len(data))
+                    if not data:
+                        continue
+                    n = len(data)
+                    _record_traffic(uuid, n)
                     if conn_id in connections:
-                        connections[conn_id]["bytes"] += len(data)
+                        connections[conn_id]["bytes"] += n
                     writer.write(data)
                     await writer.drain()
-            except (WebSocketDisconnect, Exception):
+                    if not quota_ok:
+                        break
+            except (WebSocketDisconnect, ClientDisconnect, Exception):
                 pass
 
         async def tcp_to_ws():
             try:
                 while True:
-                    data = await asyncio.wait_for(reader.read(RELAY_BUF), timeout=120.0)
+                    data = await asyncio.wait_for(reader.read(RELAY_BUF), timeout=300.0)
                     if not data:
                         break
-                    if not await check_quota(uuid, len(data)):
-                        break
-                    _record_traffic(uuid, len(data))
+                    n = len(data)
+                    _record_traffic(uuid, n)
                     if conn_id in connections:
-                        connections[conn_id]["bytes"] += len(data)
+                        connections[conn_id]["bytes"] += n
                     await websocket.send_bytes(data)
-            except Exception:
+            except (WebSocketDisconnect, ClientDisconnect, Exception):
                 pass
 
+        quota_ok = True
         task_up = asyncio.create_task(ws_to_tcp())
         task_down = asyncio.create_task(tcp_to_ws())
-        await asyncio.wait({task_up, task_down}, return_when=asyncio.FIRST_COMPLETED)
-        task_up.cancel()
-        task_down.cancel()
+        done, pending = await asyncio.wait({task_up, task_down}, return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
 
+    except (ClientDisconnect, WebSocketDisconnect):
+        pass
     except Exception as exc:
         stats["total_errors"] += 1
         error_logs.append({"error": str(exc), "time": datetime.now().isoformat()})
@@ -313,6 +325,7 @@ async def ws_proxy(websocket: WebSocket, uuid: str):
         if writer:
             try:
                 writer.close()
+                await writer.wait_closed()
             except Exception:
                 pass
         try:
@@ -393,11 +406,10 @@ async def xhttp_tcp_relay(session: XHTTPSession):
                         continue
                     if data is None:
                         break
-                    if not await check_quota(uuid_str, len(data)):
-                        break
-                    _record_traffic(uuid_str, len(data))
+                    n = len(data)
+                    _record_traffic(uuid_str, n)
                     if conn_id in connections:
-                        connections[conn_id]["bytes"] += len(data)
+                        connections[conn_id]["bytes"] += n
                     writer.write(data)
                     await writer.drain()
             except Exception:
@@ -414,11 +426,10 @@ async def xhttp_tcp_relay(session: XHTTPSession):
                     data = await reader.read(RELAY_BUF)
                     if not data:
                         break
-                    if not await check_quota(uuid_str, len(data)):
-                        break
-                    _record_traffic(uuid_str, len(data))
+                    n = len(data)
+                    _record_traffic(uuid_str, n)
                     if conn_id in connections:
-                        connections[conn_id]["bytes"] += len(data)
+                        connections[conn_id]["bytes"] += n
                     await session.to_client.put(data)
             except Exception:
                 pass
@@ -463,7 +474,7 @@ async def xhttp_downstream(uuid: str, session_id: str, request: Request):
                 if chunk is None:
                     break
                 yield chunk
-        except Exception:
+        except (ClientDisconnect, Exception):
             pass
 
     return StreamingResponse(
@@ -480,7 +491,10 @@ async def xhttp_downstream(uuid: str, session_id: str, request: Request):
 async def xhttp_upstream(uuid: str, session_id: str, seq: str, request: Request):
     stats["total_requests"] += 1
     session = await _get_or_create_session(uuid, session_id)
-    body = await request.body()
+    try:
+        body = await request.body()
+    except ClientDisconnect:
+        return Response(status_code=499, content=b"", media_type="application/octet-stream")
     if body:
         try:
             await asyncio.wait_for(session.from_client.put(body), timeout=10.0)
@@ -497,7 +511,10 @@ async def _grpc_handler(uuid: str, path: str, request: Request):
     if not await check_quota(uuid, 0):
         raise HTTPException(status_code=403, detail="quota exceeded")
 
-    body = await request.body()
+    try:
+        body = await request.body()
+    except ClientDisconnect:
+        return Response(status_code=499, content=b"", media_type="application/grpc+proto")
     if not body or len(body) < 5:
         raise HTTPException(status_code=400, detail="empty body")
 
@@ -557,21 +574,21 @@ async def _grpc_handler(uuid: str, path: str, request: Request):
             vless_resp = b"\x00\x00"
             yield b"\x00" + len(vless_resp).to_bytes(4, "big") + vless_resp
             while True:
-                data = await asyncio.wait_for(reader.read(RELAY_BUF), timeout=120.0)
+                data = await asyncio.wait_for(reader.read(RELAY_BUF), timeout=300.0)
                 if not data:
                     break
-                if not await check_quota(uuid, len(data)):
-                    break
-                _record_traffic(uuid, len(data))
+                n = len(data)
+                _record_traffic(uuid, n)
                 if conn_id in connections:
-                    connections[conn_id]["bytes"] += len(data)
-                yield b"\x00" + len(data).to_bytes(4, "big") + data
-        except Exception:
+                    connections[conn_id]["bytes"] += n
+                yield b"\x00" + n.to_bytes(4, "big") + data
+        except (ClientDisconnect, Exception):
             pass
         finally:
             yield b"\x80\x00\x00\x00\x00"
             try:
                 writer.close()
+                await writer.wait_closed()
             except Exception:
                 pass
             connections.pop(conn_id, None)
